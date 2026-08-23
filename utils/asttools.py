@@ -2,134 +2,142 @@ import luaparser
 from luaparser import ast
 from luaparser.astnodes import *
 
-class token:
-    def __init__(self, type_, leading_white, source):
-        self.Type = type_
-        self.LeadingWhite = leading_white
-        self.Source = source
-
-class astnode:
-    def __init__(self, type_):
-        self.Type = type_
-        self.Token = None
-        self.GetFirstToken = lambda: None
-        self.GetLastToken = lambda: None
+def _iter_statements(node):
+    if hasattr(node, 'body'):
+        if isinstance(node.body, list):
+            return node.body
+        elif hasattr(node.body, 'body') and isinstance(node.body.body, list):
+            return node.body.body
+    return []
 
 def _convert_node(node):
     if node is None:
         return None
     typ = type(node).__name__
-    if typ == "Chunk":
-        return {"Type": "Chunk", "StatementList": [_convert_node(stmt) for stmt in node.body]}
-    elif typ == "Function":
+    if typ == 'Chunk':
+        stmts = _iter_statements(node)
+        return {"Type": "Chunk", "StatementList": [_convert_node(s) for s in stmts]}
+    elif typ == 'Function':
         return {
             "Type": "Function",
             "Name": _convert_node(node.name),
             "Parameters": [_convert_node(p) for p in node.params],
             "Body": _convert_node(node.body)
         }
-    elif typ == "Assign":
+    elif typ == 'Assign':
         return {
             "Type": "AssignmentStat",
             "Lhs": [_convert_node(v) for v in node.targets],
             "Rhs": [_convert_node(v) for v in node.values]
         }
-    elif typ == "LocalAssign":
+    elif typ == 'LocalAssign':
         return {
             "Type": "LocalVarStat",
             "ExprList": [_convert_node(v) for v in node.values] if node.values else []
         }
-    elif typ == "Name":
+    elif typ == 'Name':
         return {"Type": "VariableExpr", "Variable": {"Name": node.id}}
-    elif typ == "Number":
+    elif typ == 'Number':
         return {"Type": "NumberLiteral", "Token": {"Type": "Number", "LeadingWhite": "", "Source": str(node.n)}}
-    elif typ == "String":
+    elif typ == 'String':
         return {"Type": "StringLiteral", "Token": {"Type": "String", "LeadingWhite": "", "Source": node.s}}
-    elif typ == "Nil":
+    elif typ == 'Nil':
         return {"Type": "NilLiteral"}
-    elif typ == "True":
+    elif typ == 'True':
         return {"Type": "BooleanLiteral", "Token": {"Type": "Boolean", "LeadingWhite": "", "Source": "true"}}
-    elif typ == "False":
+    elif typ == 'False':
         return {"Type": "BooleanLiteral", "Token": {"Type": "Boolean", "LeadingWhite": "", "Source": "false"}}
-    elif typ == "BinOp":
+    elif typ == 'BinOp':
         return {
             "Type": "BinopExpr",
             "Lhs": _convert_node(node.left),
             "Rhs": _convert_node(node.right),
             "Token_Op": {"Source": node.op}
         }
-    elif typ == "UnaryOp":
+    elif typ == 'UnaryOp':
         return {
             "Type": "UnopExpr",
             "Rhs": _convert_node(node.operand),
             "Token_Op": {"Source": node.op}
         }
-    elif typ == "Call":
+    elif typ == 'Call':
         return {
             "Type": "CallExpr",
             "Base": _convert_node(node.func),
             "FunctionArguments": {"ArgList": [_convert_node(a) for a in node.args]}
         }
-    elif typ == "Index":
+    elif typ == 'Index':
         return {
             "Type": "IndexExpr",
             "Base": _convert_node(node.obj),
             "Index": _convert_node(node.index)
         }
-    elif typ == "Parens":
+    elif typ == 'Parens':
         return {"Type": "ParenExpr", "Expression": _convert_node(node.expr)}
-    elif typ == "Return":
+    elif typ == 'Return':
         return {"Type": "ReturnStat", "ExprList": [_convert_node(v) for v in node.values] if node.values else []}
-    elif typ == "If":
+    elif typ == 'If':
+        else_clauses = []
+        if node.else_body is not None:
+            for else_node in node.else_body:
+                if hasattr(else_node, 'cond'):
+                    else_clauses.append({
+                        "ClauseType": "elseif",
+                        "Condition": _convert_node(else_node.cond),
+                        "Body": {"StatementList": [_convert_node(s) for s in _iter_statements(else_node.body)]}
+                    })
+                else:
+                    else_clauses.append({
+                        "ClauseType": "else",
+                        "Body": {"StatementList": [_convert_node(s) for s in _iter_statements(else_node)]}
+                    })
         return {
             "Type": "IfStat",
             "Condition": _convert_node(node.cond),
-            "Body": {"StatementList": [_convert_node(s) for s in node.then_body]},
-            "ElseClauseList": [_convert_node(s) for s in node.else_body] if node.else_body else []
+            "Body": {"StatementList": [_convert_node(s) for s in _iter_statements(node.then_body)]},
+            "ElseClauseList": else_clauses
         }
-    elif typ == "While":
+    elif typ == 'While':
         return {
             "Type": "WhileStat",
             "Condition": _convert_node(node.cond),
-            "Body": {"StatementList": [_convert_node(s) for s in node.body]}
+            "Body": {"StatementList": [_convert_node(s) for s in _iter_statements(node.body)]}
         }
-    elif typ == "Repeat":
+    elif typ == 'Repeat':
         return {
             "Type": "RepeatStat",
             "Condition": _convert_node(node.cond),
-            "Body": {"StatementList": [_convert_node(s) for s in node.body]}
+            "Body": {"StatementList": [_convert_node(s) for s in _iter_statements(node.body)]}
         }
-    elif typ == "For":
+    elif typ == 'For':
         return {
             "Type": "NumericForStat",
+            "Variable": _convert_node(node.var) if hasattr(node, 'var') else {"Type": "VariableExpr", "Variable": {"Name": node.var_name}},
             "RangeList": [_convert_node(node.start), _convert_node(node.end), _convert_node(node.step) if node.step else None],
-            "Body": {"StatementList": [_convert_node(s) for s in node.body]}
+            "Body": {"StatementList": [_convert_node(s) for s in _iter_statements(node.body)]}
         }
-    elif typ == "ForIn":
+    elif typ == 'ForIn':
         return {
             "Type": "GenericForStat",
             "Names": [_convert_node(v) for v in node.names],
             "ExprList": [_convert_node(v) for v in node.exprs],
-            "Body": {"StatementList": [_convert_node(s) for s in node.body]}
+            "Body": {"StatementList": [_convert_node(s) for s in _iter_statements(node.body)]}
         }
-    elif typ == "FuncDef":
+    elif typ == 'FunctionDef':
         return {
             "Type": "FunctionDef",
             "Name": _convert_node(node.name),
             "Parameters": [_convert_node(p) for p in node.params],
             "Body": _convert_node(node.body)
         }
-    elif typ == "Table":
-        return {
-            "Type": "TableLiteral",
-            "Fields": [_convert_node(f) for f in node.fields] if hasattr(node, 'fields') else []
-        }
-    elif typ == "TableField":
-        return {
-            "Type": "TableField",
-            "Key": _convert_node(node.key) if node.key else None,
-            "Value": _convert_node(node.value)
-        }
+    elif typ == 'Table':
+        fields = []
+        for f in node.fields:
+            if f.key is not None:
+                fields.append({"Key": _convert_node(f.key), "Value": _convert_node(f.value)})
+            else:
+                fields.append({"Value": _convert_node(f.value)})
+        return {"Type": "TableLiteral", "Fields": fields}
     else:
         return {"Type": typ, "Raw": repr(node)}
 
@@ -161,8 +169,6 @@ def refineast(ast, options):
                 for item in node:
                     rename(item)
         rename(ast)
-    if options.get("Format"):
-        pass
     return ast
 
 def refineastnode(ast, options):
