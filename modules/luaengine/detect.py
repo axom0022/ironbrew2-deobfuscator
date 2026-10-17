@@ -4,7 +4,7 @@ from .transform import extractcontext, parsebytecode, emitcode
 from .flatten import flatten
 from utils import asttools as parser
 
-_PATTERNS = [
+patterns = [
     re.compile(r"return\s+table\.concat\s*\([_\-a-zA-Z0-9]+\)"),
     re.compile(r"return\s+[_\-a-zA-Z0-9]+\s*\([^()]*,\s*\{\s*\}\s*,"),
     re.compile(r"bit\s+and\s+bit\.bxor\s+or\s+function\s*\("),
@@ -17,7 +17,7 @@ def detect(source):
     head = source[:16384]
     tail = source[-8192:] if len(source) > 16384 else ""
     sample = head + "\n" + tail
-    return any(p.search(sample) for p in _PATTERNS)
+    return any(p.search(sample) for p in patterns)
 
 
 def execute(astroot):
