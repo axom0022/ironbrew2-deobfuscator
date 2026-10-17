@@ -382,13 +382,13 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
     consts = chunk.get("Constants", [])
     protos = chunk.get("Prototypes", [])
     numparams = chunk.get("Parameters") or 0
-    isvararg = bool(chunk.get("VarArg"))
     upvalnames = upvalnames or {}
     n = len(insts)
 
     jumptargets = set()
     backjumpsto = {}
     branchpcs = []
+    forwardjumps = []
     for pc, ins in enumerate(insts):
         if ins.get("_skip") or ins.get("CustomOp"):
             continue
@@ -402,14 +402,20 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
             if not istforprepjmp:
                 branchpcs.append(pc)
         if "_target_pc" in ins:
-            jumptargets.add(ins["_target_pc"])
+            t = ins["_target_pc"]
+            jumptargets.add(t)
+            jpc = ins.get("_jmp_pc") or pc
+            if t > jpc + 1:
+                forwardjumps.append((pc, t))
         elif op in ("Jmp", "ForLoop", "ForPrep"):
             t = pc + 1 + (ins.get("B") or 0)
-            if op == "ForPrep":
-                t += 1
             jumptargets.add(t)
+            if op == "ForPrep":
+                jumptargets.add(t + 1)
             if op == "Jmp" and t <= pc:
                 backjumpsto.setdefault(t, []).append(pc)
+            elif t > pc + 1:
+                forwardjumps.append((pc, t))
 
     for t in backjumpsto:
         backjumpsto[t].sort(reverse=True)
@@ -419,16 +425,23 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
     regreadcount = {}
     regwritepcs = {}
     regreadpcs = {}
+    insreads = [set() for idx in range(n)]
+    inswrites = [set() for idx in range(n)]
+    upvalregs = set()
 
     def recordwrite(r, pc):
         if r is not None and 0 <= r < 256:
             regwritecount[r] = regwritecount.get(r, 0) + 1
             regwritepcs.setdefault(r, []).append(pc)
+            if 0 <= pc < n:
+                inswrites[pc].add(r)
 
     def recordread(r, pc):
         if r is not None and 0 <= r < 256:
             regreadcount[r] = regreadcount.get(r, 0) + 1
             regreadpcs.setdefault(r, []).append(pc)
+            if 0 <= pc < n:
+                insreads[pc].add(r)
 
     for r in range(numparams):
         recordwrite(r, -1)
@@ -546,6 +559,7 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
         elif op == "Closure":
             for btype, bidx in ins.get("_upval_bindings", []):
                 if btype == "reg":
+                    upvalregs.add(bidx)
                     recordread(bidx, pc)
                     recordread(bidx, pc)
             recordwrite(a, pc)
@@ -560,6 +574,7 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                 recordwrite(a, pc)
 
     persistentlocals = set(range(numparams))
+    usedupvalnames = set(upvalnames.values())
 
     regnames = {}
     for r in range(numparams):
@@ -567,10 +582,13 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
 
     def getvarname(r):
         if r not in regnames:
-            regnames[r] = f"v{r}"
+            cand = f"v{r}"
+            if cand in usedupvalnames:
+                cand = f"l{r}"
+            regnames[r] = cand
         return regnames[r]
 
-    declaredlocals = set(range(numparams))
+    rootdeclared = set(range(numparams))
     regexpr = {r: regnames[r] for r in range(numparams)}
     selfcallinfo = {}
     tablebuilders = {}
@@ -579,6 +597,41 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
     def hasinrange(sortedlist, loexclusive, hiinclusive):
         idx = bisectright(sortedlist, loexclusive)
         return idx < len(sortedlist) and sortedlist[idx] <= hiinclusive
+
+    def hasjumpover( r, startpc, targetpc ):
+        rlist = regreadpcs.get(r)
+        if not rlist:
+            return False
+        wlist = regwritepcs.get(r, [])
+        for jpc, jtarget in forwardjumps:
+            if startpc <= jpc < targetpc and jtarget > targetpc:
+                ridx = bisectright(rlist, jtarget - 1)
+                if ridx < len(rlist):
+                    rafter = rlist[ridx]
+                    widx = bisectright(wlist, jtarget - 1)
+                    wafter = wlist[widx] if widx < len(wlist) else n
+                    if rafter <= wafter:
+                        return True
+        return False
+
+    def caninlinebetween(defpc, usepc):
+        if not (0 <= defpc < n):
+            return False
+        defreads = insreads[defpc]
+        for k in range(defpc + 1, usepc):
+            kins = insts[k]
+            if kins.get("_skip") or kins.get("CustomOp"):
+                continue
+            kop = kins["OpName"]
+            if kop in ("SetGlobal", "SetUpval", "Return", "TailCall", "ForPrep", "ForLoop", "TForLoop", "Close"):
+                return False
+            if kop == "Call":
+                kc = kins.get("C") or 0
+                if kc == 1 or kc > 2:
+                    return False
+            if inswrites[k] & defreads:
+                return False
+        return True
 
     def issingleusetemp(r, defpc):
         if r in persistentlocals:
@@ -601,10 +654,32 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
             return False
         if hasinrange(branchpcs, defpc, usepc - 1):
             return False
+        if not caninlinebetween(defpc, usepc):
+            return False
         if nextw < n and rend < len(rlist):
-            if hasinrange(branchpcs, defpc, nextw - 1):
+            if hasjumpover(r, defpc, nextw):
                 return False
         return True
+
+    def isdeadloadnil(r, pc):
+        if r in upvalregs:
+            return False
+        wlist = regwritepcs.get(r)
+        if not wlist:
+            return False
+        widx = bisectright(wlist, pc)
+        if widx >= len(wlist):
+            return False
+        nextw = wlist[widx]
+        rlist = regreadpcs.get(r)
+        if rlist:
+            ridx = bisectright(rlist, pc)
+            nextr = rlist[ridx] if ridx < len(rlist) else n
+        else:
+            nextr = n
+        if nextw < nextr and not hasjumpover(r, pc, nextw):
+            return True
+        return False
 
     def needsparensasprefix(exprs):
         return (
@@ -632,9 +707,7 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
             regexpr[r] = expr
         return regexpr.get(r, getvarname(r))
 
-    toppredeclared = set()
-
-    def assignreg(r, expr, lines, curindent, forcestmt=False, nextpc=None):
+    def assignreg(r, expr, lines, curindent, declaredlocals, parentdeclared, forcestmt=False, nextpc=None):
         selfcallinfo.pop(r, None)
         tablebuilders.pop(r, None)
         defpc = (nextpc - 1) if nextpc is not None else -1
@@ -645,11 +718,14 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
             pad = "    " * curindent
             if r not in declaredlocals:
                 declaredlocals.add(r)
-                if curindent > indent:
-                    toppredeclared.add(vname)
-                    lines.append(f"{pad}{vname} = {expr}")
-                else:
-                    lines.append(f"{pad}local {vname} = {expr}")
+                lines.append(f"{pad}local {vname} = {expr}")
+            elif (
+                r >= numparams
+                and r not in upvalregs
+                and r not in parentdeclared
+                and not re.search(r"\b" + re.escape(vname) + r"\b", expr)
+            ):
+                lines.append(f"{pad}local {vname} = {expr}")
             elif vname != expr:
                 lines.append(f"{pad}{vname} = {expr}")
             regexpr[r] = vname
@@ -681,7 +757,7 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
             return f"not {v}" if c else v
         return "true"
 
-    def decompilerange(startpc, endpc, curindent, loopexitpc=None):
+    def decompilerange(startpc, endpc, curindent, declaredlocals, parentdeclared, loopexitpc=None):
         lines = []
         pc = startpc
         pad = "    " * curindent
@@ -712,18 +788,20 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                 sins = insts[backjmppc]
                 sins["_skip"] = True
                 whileexitpc = backjmppc + 1
+                childdecl = set(declaredlocals)
+                childparent = set(declaredlocals)
                 if op in ("Eq", "Lt", "Le", "Test", "TestSet") and ins.get("_target_pc") == whileexitpc:
                     condstr = buildcondexpr(ins)
                     bodystart = (ins.get("_jmp_pc") or pc) + 1
                     lines.append(f"{pad}while {condstr} do")
-                    bodylines = decompilerange(bodystart, backjmppc, curindent + 1, loopexitpc=whileexitpc)
+                    bodylines = decompilerange(bodystart, backjmppc, curindent + 1, childdecl, childparent, loopexitpc=whileexitpc)
                     lines.extend(bodylines)
                     lines.append(f"{pad}end")
                     pc = whileexitpc
                     continue
                 else:
                     lines.append(f"{pad}while true do")
-                    bodylines = decompilerange(pc, backjmppc, curindent + 1, loopexitpc=whileexitpc)
+                    bodylines = decompilerange(pc, backjmppc, curindent + 1, childdecl, childparent, loopexitpc=whileexitpc)
                     lines.extend(bodylines)
                     lines.append(f"{pad}end")
                     pc = whileexitpc
@@ -732,17 +810,17 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
             if op == "Move":
                 if a != b:
                     val = readreg(b)
-                    assignreg(a, val, lines, curindent, nextpc=pc + 1)
+                    assignreg(a, val, lines, curindent, declaredlocals, parentdeclared, nextpc=pc + 1)
                 pc += 1
 
             elif op == "LoadK":
                 val = formatconst(consts[b]) if 0 <= b < len(consts) else "nil"
-                assignreg(a, val, lines, curindent, nextpc=pc + 1)
+                assignreg(a, val, lines, curindent, declaredlocals, parentdeclared, nextpc=pc + 1)
                 pc += 1
 
             elif op == "LoadBool":
                 val = "true" if b != 0 else "false"
-                assignreg(a, val, lines, curindent, nextpc=pc + 1)
+                assignreg(a, val, lines, curindent, declaredlocals, parentdeclared, nextpc=pc + 1)
                 if c != 0:
                     pc += 2
                 else:
@@ -750,12 +828,15 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
 
             elif op == "LoadNil":
                 for r in range(a, b + 1):
-                    assignreg(r, "nil", lines, curindent, nextpc=pc + 1)
+                    if isdeadloadnil(r, pc) and r not in declaredlocals:
+                        regexpr[r] = "nil"
+                        continue
+                    assignreg(r, "nil", lines, curindent, declaredlocals, parentdeclared, nextpc=pc + 1)
                 pc += 1
 
             elif op == "GetUpval":
                 uname = upvalnames.get(b, f"upval_{b}")
-                assignreg(a, uname, lines, curindent, nextpc=pc + 1)
+                assignreg(a, uname, lines, curindent, declaredlocals, parentdeclared, nextpc=pc + 1)
                 pc += 1
 
             elif op == "SetUpval":
@@ -768,7 +849,7 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                 gname = consts[b] if 0 <= b < len(consts) else f"_G[{b}]"
                 if not isvalidident(gname):
                     gname = f"_G[{formatconst(gname)}]"
-                assignreg(a, gname, lines, curindent, nextpc=pc + 1)
+                assignreg(a, gname, lines, curindent, declaredlocals, parentdeclared, nextpc=pc + 1)
                 pc += 1
 
             elif op == "SetGlobal":
@@ -781,6 +862,22 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                 pc += 1
 
             elif op == "NewTable":
+                if (
+                    pc + 2 < n
+                    and not insts[pc + 1].get("_skip")
+                    and not insts[pc + 2].get("_skip")
+                    and insts[pc + 1]["OpName"] == "VarArg"
+                    and (insts[pc + 1].get("A") or 0) == a + 1
+                    and (insts[pc + 1].get("B") or 0) == 0
+                    and insts[pc + 2]["OpName"] == "SetList"
+                    and (insts[pc + 2].get("A") or 0) == a
+                    and (insts[pc + 2].get("B") or 0) == 0
+                ):
+                    insts[pc + 1]["_skip"] = True
+                    insts[pc + 2]["_skip"] = True
+                    assignreg(a, "{...}", lines, curindent, declaredlocals, parentdeclared, nextpc=pc + 3)
+                    pc += 3
+                    continue
                 wlist = regwritepcs.get(a)
                 if wlist:
                     widx = bisectright(wlist, pc)
@@ -798,7 +895,7 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                     tablebuilders[a] = []
                     regexpr[a] = "{}"
                 else:
-                    assignreg(a, "{}", lines, curindent, forcestmt=True, nextpc=pc + 1)
+                    assignreg(a, "{}", lines, curindent, declaredlocals, parentdeclared, forcestmt=True, nextpc=pc + 1)
                 pc += 1
 
             elif op == "GetTable":
@@ -810,7 +907,7 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                 else:
                     idx = rkexpr(c)
                     expr = f"{tbl}[{idx}]"
-                assignreg(a, expr, lines, curindent, nextpc=pc + 1)
+                assignreg(a, expr, lines, curindent, declaredlocals, parentdeclared, nextpc=pc + 1)
                 pc += 1
 
             elif op == "SetTable":
@@ -869,7 +966,7 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                 sym = {"Add": "+", "Sub": "-", "Mul": "*", "Div": "/", "Mod": "%", "Pow": "^"}[op]
                 lhs = rkexpr(b)
                 rhs = rkexpr(c)
-                assignreg(a, f"({lhs} {sym} {rhs})", lines, curindent, nextpc=pc + 1)
+                assignreg(a, f"({lhs} {sym} {rhs})", lines, curindent, declaredlocals, parentdeclared, nextpc=pc + 1)
                 pc += 1
 
             elif op in ("Unm", "Not", "Len"):
@@ -880,12 +977,12 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                     expr = f"not {rhs}"
                 else:
                     expr = f"#{rhs}"
-                assignreg(a, expr, lines, curindent, nextpc=pc + 1)
+                assignreg(a, expr, lines, curindent, declaredlocals, parentdeclared, nextpc=pc + 1)
                 pc += 1
 
             elif op == "Concat":
                 parts = [readreg(r) for r in range(b, c + 1)]
-                assignreg(a, " .. ".join(parts), lines, curindent, nextpc=pc + 1)
+                assignreg(a, " .. ".join(parts), lines, curindent, declaredlocals, parentdeclared, nextpc=pc + 1)
                 pc += 1
 
             elif op in ("Call", "TailCall"):
@@ -913,7 +1010,11 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                 if op == "TailCall":
                     if pc + 1 < n and insts[pc + 1]["OpName"] == "Return":
                         insts[pc + 1]["_skip"] = True
-                    hasmore = any(not insts[k].get("_skip") for k in range(pc + 1, min(endpc, n)))
+                    hasmore = any(
+                        not insts[k].get("_skip")
+                        and not (k == n - 1 and insts[k]["OpName"] == "Return" and (insts[k].get("B") or 0) == 1)
+                        for k in range(pc + 1, min(endpc, n))
+                    )
                     if hasmore:
                         lines.append(f"{pad}do return {callstr} end")
                     else:
@@ -925,7 +1026,7 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                     regexpr[a] = callstr
                     multretreg[0] = a
                 elif c == 2:
-                    assignreg(a, callstr, lines, curindent, nextpc=pc + 1)
+                    assignreg(a, callstr, lines, curindent, declaredlocals, parentdeclared, nextpc=pc + 1)
                 elif (
                     c == 4
                     and pc + 1 < n
@@ -944,10 +1045,9 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                         vname = getvarname(r)
                         if r not in declaredlocals:
                             declaredlocals.add(r)
-                            if curindent > indent:
-                                toppredeclared.add(vname)
-                            else:
-                                newdecl = True
+                            newdecl = True
+                        elif r >= numparams and r not in upvalregs and r not in parentdeclared:
+                            newdecl = True
                         regexpr[r] = vname
                         lhsvars.append(vname)
                     prefix = "local " if newdecl else ""
@@ -980,7 +1080,7 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                     regexpr[a] = "..."
                     multretreg[0] = a
                 elif b == 2:
-                    assignreg(a, "...", lines, curindent, nextpc=pc + 1)
+                    assignreg(a, "...", lines, curindent, declaredlocals, parentdeclared, nextpc=pc + 1)
                 elif b > 2:
                     lhsvars = []
                     for r in range(a, a + b - 1):
@@ -1010,23 +1110,26 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                         fnexpr = f"function({', '.join(pparams)}) end"
                 else:
                     fnexpr = "function() end"
-                assignreg(a, fnexpr, lines, curindent, nextpc=pc + 1)
+                assignreg(a, fnexpr, lines, curindent, declaredlocals, parentdeclared, nextpc=pc + 1)
                 pc += 1
 
             elif op == "ForPrep":
                 startv = readreg(a)
                 limitv = readreg(a + 1)
                 stepv = readreg(a + 2)
-                forlooppc = pc + 1 + b + 1
+                forlooppc = pc + 1 + b
+                if 0 <= forlooppc < n and insts[forlooppc]["OpName"] != "ForLoop" and forlooppc + 1 < n and insts[forlooppc + 1]["OpName"] == "ForLoop":
+                    forlooppc += 1
                 loopvar = f"i_{a + 3}"
                 regnames[a + 3] = loopvar
-                declaredlocals.add(a + 3)
+                childdecl = set(declaredlocals) | {a + 3}
+                childparent = set(declaredlocals) | {a + 3}
                 regexpr[a + 3] = loopvar
                 steppart = "" if stepv == "1" else f", {stepv}"
                 lines.append(f"{pad}for {loopvar} = {startv}, {limitv}{steppart} do")
                 if pc + 1 <= forlooppc < n:
                     insts[forlooppc]["_skip"] = True
-                    bodylines = decompilerange(pc + 1, forlooppc, curindent + 1, loopexitpc=forlooppc + 1)
+                    bodylines = decompilerange(pc + 1, forlooppc, curindent + 1, childdecl, childparent, loopexitpc=forlooppc + 1)
                     lines.extend(bodylines)
                     pc = forlooppc + 1
                 else:
@@ -1050,17 +1153,19 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                         else:
                             iterstr = f"{g0}, {g1}, {g2}"
                     loopvars = []
+                    childdecl = set(declaredlocals)
                     for idxv in range(tfc):
                         rv = tfa + 3 + idxv
                         vname = f"k_{rv}" if idxv == 0 else f"v_{rv}"
                         regnames[rv] = vname
-                        declaredlocals.add(rv)
+                        childdecl.add(rv)
                         regexpr[rv] = vname
                         loopvars.append(vname)
+                    childparent = set(childdecl)
                     lines.append(f"{pad}for {', '.join(loopvars)} in {iterstr} do")
                     tforins["_skip"] = True
                     nextaftertfor = (tforins.get("_jmp_pc") or target) + 1
-                    bodylines = decompilerange(pc + 1, target, curindent + 1, loopexitpc=nextaftertfor)
+                    bodylines = decompilerange(pc + 1, target, curindent + 1, childdecl, childparent, loopexitpc=nextaftertfor)
                     lines.extend(bodylines)
                     lines.append(f"{pad}end")
                     pc = nextaftertfor
@@ -1071,9 +1176,70 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                 pc += 1
 
             elif op in ("Eq", "Lt", "Le", "Test", "TestSet"):
+                def flipcondins(cins):
+                    res = dict(cins)
+                    cop = res["OpName"]
+                    if cop in ("Eq", "Lt", "Le"):
+                        res["A"] = 0 if res.get("A") else 1
+                    else:
+                        res["C"] = 0 if res.get("C") else 1
+                    return res
+
                 condstr = buildcondexpr(ins)
                 thenstart = (ins.get("_jmp_pc") or pc) + 1
                 falsetarget = ins.get("_target_pc", thenstart)
+
+                if op in ("Eq", "Lt", "Le", "Test") and thenstart < falsetarget <= endpc:
+                    savedregexpr = dict(regexpr)
+                    saveddecl = set(declaredlocals)
+                    savedself = dict(selfcallinfo)
+                    orclauses = [buildcondexpr(flipcondins(ins))]
+                    scanpc = thenstart
+                    orsuccess = False
+                    pureops = (
+                        "Move", "LoadK", "LoadBool", "GetUpval", "GetGlobal", "GetTable",
+                        "Self", "Add", "Sub", "Mul", "Div", "Mod", "Pow", "Unm", "Not", "Len", "Concat"
+                    )
+                    while scanpc < falsetarget:
+                        bpc = None
+                        pureok = True
+                        for k in range(scanpc, falsetarget):
+                            kins = insts[k]
+                            if kins.get("_skip") or kins.get("CustomOp"):
+                                continue
+                            if kins["OpName"] in ("Eq", "Lt", "Le", "Test"):
+                                bpc = k
+                                break
+                            if kins["OpName"] not in pureops:
+                                pureok = False
+                                break
+                        if not pureok or bpc is None:
+                            break
+                        sublines = decompilerange(scanpc, bpc, curindent, declaredlocals, parentdeclared, loopexitpc=loopexitpc)
+                        if sublines:
+                            break
+                        bins = insts[bpc]
+                        bthen = (bins.get("_jmp_pc") or bpc) + 1
+                        bfalse = bins.get("_target_pc", bthen)
+                        if bthen < falsetarget and bfalse == falsetarget:
+                            orclauses.append(buildcondexpr(flipcondins(bins)))
+                            scanpc = bthen
+                        elif bthen == falsetarget and bfalse > falsetarget:
+                            orclauses.append(buildcondexpr(bins))
+                            condstr = " or ".join(orclauses)
+                            thenstart = falsetarget
+                            falsetarget = bfalse
+                            orsuccess = True
+                            break
+                        else:
+                            break
+                    if not orsuccess:
+                        regexpr.clear()
+                        regexpr.update(savedregexpr)
+                        declaredlocals.clear()
+                        declaredlocals.update(saveddecl)
+                        selfcallinfo.clear()
+                        selfcallinfo.update(savedself)
 
                 if (
                     falsetarget == thenstart + 1
@@ -1084,7 +1250,9 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                     and insts[thenstart].get("A") == insts[thenstart + 1].get("A")
                 ):
                     dstr = insts[thenstart].get("A") or 0
-                    assignreg(dstr, f"({condstr})", lines, curindent, nextpc=thenstart + 2)
+                    boolins = flipcondins(ins) if (insts[thenstart].get("B") or 0) == 0 else dict(ins)
+                    bcond = buildcondexpr(boolins)
+                    assignreg(dstr, f"({bcond})", lines, curindent, declaredlocals, parentdeclared, nextpc=thenstart + 2)
                     pc = thenstart + 2
                     continue
 
@@ -1112,25 +1280,33 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
                                 continue
                             lastthenins["_skip"] = True
                             lines.append(f"{pad}if {condstr} then")
-                            thenlines = decompilerange(thenstart, falsetarget - 1, curindent + 1, loopexitpc=loopexitpc)
+                            thendecl = set(declaredlocals)
+                            thenparent = set(declaredlocals)
+                            thenlines = decompilerange(thenstart, falsetarget - 1, curindent + 1, thendecl, thenparent, loopexitpc=loopexitpc)
                             lines.extend(thenlines)
                             if falsetarget < min(endifpc, endpc):
                                 lines.append(f"{pad}else")
-                                elselines = decompilerange(falsetarget, min(endifpc, endpc), curindent + 1, loopexitpc=loopexitpc)
+                                elsedecl = set(declaredlocals)
+                                elseparent = set(declaredlocals)
+                                elselines = decompilerange(falsetarget, min(endifpc, endpc), curindent + 1, elsedecl, elseparent, loopexitpc=loopexitpc)
                                 lines.extend(elselines)
                             lines.append(f"{pad}end")
                             pc = max(falsetarget, min(endifpc, endpc))
                             continue
                         else:
                             lines.append(f"{pad}if {condstr} then")
-                            thenlines = decompilerange(thenstart, falsetarget, curindent + 1, loopexitpc=loopexitpc)
+                            thendecl = set(declaredlocals)
+                            thenparent = set(declaredlocals)
+                            thenlines = decompilerange(thenstart, falsetarget, curindent + 1, thendecl, thenparent, loopexitpc=loopexitpc)
                             lines.extend(thenlines)
                             lines.append(f"{pad}end")
                             pc = falsetarget
                             continue
                     else:
                         lines.append(f"{pad}if {condstr} then")
-                        thenlines = decompilerange(thenstart, endpc, curindent + 1, loopexitpc=loopexitpc)
+                        thendecl = set(declaredlocals)
+                        thenparent = set(declaredlocals)
+                        thenlines = decompilerange(thenstart, endpc, curindent + 1, thendecl, thenparent, loopexitpc=loopexitpc)
                         lines.extend(thenlines)
                         lines.append(f"{pad}end")
                         pc = endpc
@@ -1142,9 +1318,5 @@ def decompilechunk(chunk, indent=0, upvalnames=None):
 
         return lines
 
-    outlines = decompilerange(0, n, indent)
-    if toppredeclared:
-        pad = "    " * indent
-        prevars = ", ".join(sorted(toppredeclared, key=lambda x: int(x[1:]) if x[1:].isdigit() else 999))
-        outlines.insert(0, f"{pad}local {prevars}")
+    outlines = decompilerange(0, n, indent, rootdeclared, set(rootdeclared))
     return "\n".join(outlines)
