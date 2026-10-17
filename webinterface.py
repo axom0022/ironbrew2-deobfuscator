@@ -3,15 +3,15 @@ import sys
 import io
 import re
 import importlib
-from flask import Flask, request, render_template_string, jsonify, send_file
+from flask import Flask as flaskapp, request, render_template_string as rendertemplate, jsonify
 
 from utils import asttools as parser
 from utils.codec import instructionset, instructioncategories
 from modules.luaengine.detect import detect, execute
 
-app = Flask(__name__)
+app = flaskapp("webinterface")
 
-HTML_TEMPLATE = """
+htmltemplate = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -295,14 +295,14 @@ HTML_TEMPLATE = """
             </div>
             <div class="input-area">
                 <div class="file-upload">
-                    <label for="fileInput">📁 Upload File</label>
-                    <input type="file" id="fileInput" accept=".lua,.luac,.txt">
-                    <span class="file-name" id="fileName">No file selected</span>
+                    <label for="fileinput">📁 Upload File</label>
+                    <input type="file" id="fileinput" accept=".lua,.luac,.txt">
+                    <span class="file-name" id="filename">No file selected</span>
                 </div>
-                <textarea id="inputCode" placeholder="Paste your obfuscated Lua code here..."></textarea>
+                <textarea id="inputcode" placeholder="Paste your obfuscated Lua code here..."></textarea>
                 <div class="action-row">
-                    <button class="btn btn-primary" id="deobfuscateBtn">⚡ Deobfuscate</button>
-                    <button class="btn btn-secondary" id="clearInputBtn">🗑️ Clear</button>
+                    <button class="btn btn-primary" id="deobfuscatebtn">⚡ Deobfuscate</button>
+                    <button class="btn btn-secondary" id="clearinputbtn">🗑️ Clear</button>
                 </div>
             </div>
         </div>
@@ -312,11 +312,11 @@ HTML_TEMPLATE = """
                 <span class="badge">Deobfuscated</span>
             </div>
             <div class="output-area">
-                <textarea id="outputCode" readonly placeholder="Deobfuscated code will appear here..."></textarea>
+                <textarea id="outputcode" readonly placeholder="Deobfuscated code will appear here..."></textarea>
                 <div class="output-actions">
-                    <button class="btn btn-success" id="copyBtn">📋 Copy</button>
-                    <button class="btn btn-primary" id="saveBtn">💾 Save As File</button>
-                    <button class="btn btn-secondary" id="clearOutputBtn">🗑️ Clear</button>
+                    <button class="btn btn-success" id="copybtn">📋 Copy</button>
+                    <button class="btn btn-primary" id="savebtn">💾 Save As File</button>
+                    <button class="btn btn-secondary" id="clearoutputbtn">🗑️ Clear</button>
                 </div>
             </div>
         </div>
@@ -324,67 +324,67 @@ HTML_TEMPLATE = """
     <div id="toast" class="toast"></div>
     <script>
         (function(){
-            const themeSelect = document.getElementById('theme');
+            const themeselect = document.getElementById('theme');
             const body = document.body;
-            const inputCode = document.getElementById('inputCode');
-            const outputCode = document.getElementById('outputCode');
-            const fileInput = document.getElementById('fileInput');
-            const fileName = document.getElementById('fileName');
-            const deobfuscateBtn = document.getElementById('deobfuscateBtn');
-            const clearInputBtn = document.getElementById('clearInputBtn');
-            const copyBtn = document.getElementById('copyBtn');
-            const saveBtn = document.getElementById('saveBtn');
-            const clearOutputBtn = document.getElementById('clearOutputBtn');
+            const inputcode = document.getElementById('inputcode');
+            const outputcode = document.getElementById('outputcode');
+            const fileinput = document.getElementById('fileinput');
+            const filename = document.getElementById('filename');
+            const deobfuscatebtn = document.getElementById('deobfuscatebtn');
+            const clearinputbtn = document.getElementById('clearinputbtn');
+            const copybtn = document.getElementById('copybtn');
+            const savebtn = document.getElementById('savebtn');
+            const clearoutputbtn = document.getElementById('clearoutputbtn');
             const toast = document.getElementById('toast');
-            let toastTimer = null;
-            function showToast(msg) {
+            let toasttimer = null;
+            function showtoast(msg) {
                 toast.textContent = msg;
                 toast.classList.add('show');
-                clearTimeout(toastTimer);
-                toastTimer = setTimeout(() => toast.classList.remove('show'), 3000);
+                clearTimeout(toasttimer);
+                toasttimer = setTimeout(() => toast.classList.remove('show'), 3000);
             }
-            function applyTheme(theme) {
+            function applytheme(theme) {
                 body.className = '';
                 if (theme !== 'default') body.classList.add('theme-' + theme);
                 localStorage.setItem('theme', theme);
             }
-            themeSelect.addEventListener('change', function(){ applyTheme(this.value); });
-            const savedTheme = localStorage.getItem('theme') || 'default';
-            themeSelect.value = savedTheme;
-            applyTheme(savedTheme);
-            fileInput.addEventListener('change', function(e) {
+            themeselect.addEventListener('change', function(){ applytheme(this.value); });
+            const savedtheme = localStorage.getItem('theme') || 'default';
+            themeselect.value = savedtheme;
+            applytheme(savedtheme);
+            fileinput.addEventListener('change', function(e) {
                 const file = e.target.files[0];
-                if (!file) { fileName.textContent = 'No file selected'; return; }
-                fileName.textContent = file.name;
+                if (!file) { filename.textContent = 'No file selected'; return; }
+                filename.textContent = file.name;
                 const reader = new FileReader();
                 reader.onload = function(ev) {
-                    inputCode.value = ev.target.result;
-                    showToast('Loaded ' + file.name);
+                    inputcode.value = ev.target.result;
+                    showtoast('Loaded ' + file.name);
                 };
-                reader.onerror = function() { showToast('Error reading file'); };
+                reader.onerror = function() { showtoast('Error reading file'); };
                 reader.readAsText(file);
             });
-            clearInputBtn.addEventListener('click', function() {
-                inputCode.value = '';
-                fileInput.value = '';
-                fileName.textContent = 'No file selected';
+            clearinputbtn.addEventListener('click', function() {
+                inputcode.value = '';
+                fileinput.value = '';
+                filename.textContent = 'No file selected';
             });
-            clearOutputBtn.addEventListener('click', function() {
-                outputCode.value = '';
+            clearoutputbtn.addEventListener('click', function() {
+                outputcode.value = '';
             });
-            copyBtn.addEventListener('click', function() {
-                if (!outputCode.value) { showToast('Nothing to copy'); return; }
-                navigator.clipboard.writeText(outputCode.value).then(() => {
-                    showToast('Copied to clipboard!');
+            copybtn.addEventListener('click', function() {
+                if (!outputcode.value) { showtoast('Nothing to copy'); return; }
+                navigator.clipboard.writeText(outputcode.value).then(() => {
+                    showtoast('Copied to clipboard!');
                 }).catch(() => {
-                    outputCode.select();
+                    outputcode.select();
                     document.execCommand('copy');
-                    showToast('Copied!');
+                    showtoast('Copied!');
                 });
             });
-            saveBtn.addEventListener('click', function() {
-                if (!outputCode.value) { showToast('No output to save'); return; }
-                const blob = new Blob([outputCode.value], { type: 'text/plain' });
+            savebtn.addEventListener('click', function() {
+                if (!outputcode.value) { showtoast('No output to save'); return; }
+                const blob = new Blob([outputcode.value], { type: 'text/plain' });
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
@@ -393,12 +393,12 @@ HTML_TEMPLATE = """
                 a.click();
                 document.body.removeChild(a);
                 URL.revokeObjectURL(url);
-                showToast('File saved!');
+                showtoast('File saved!');
             });
-            deobfuscateBtn.addEventListener('click', function() {
-                const code = inputCode.value.trim();
-                if (!code) { showToast('Please enter some Lua code'); return; }
-                showToast('Deobfuscating...');
+            deobfuscatebtn.addEventListener('click', function() {
+                const code = inputcode.value.trim();
+                if (!code) { showtoast('Please enter some Lua code'); return; }
+                showtoast('Deobfuscating...');
                 fetch('/deobfuscate', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -407,19 +407,19 @@ HTML_TEMPLATE = """
                 .then(res => res.json())
                 .then(data => {
                     if (data.error) {
-                        showToast('Error: ' + data.error);
+                        showtoast('Error: ' + data.error);
                     } else {
-                        outputCode.value = data.result;
-                        showToast('Deobfuscation complete!');
+                        outputcode.value = data.result;
+                        showtoast('Deobfuscation complete!');
                     }
                 })
                 .catch(err => {
-                    showToast('Network error: ' + err.message);
+                    showtoast('Network error: ' + err.message);
                 });
             });
             document.addEventListener('keydown', function(e) {
                 if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-                    deobfuscateBtn.click();
+                    deobfuscatebtn.click();
                 }
             });
         })();
@@ -430,7 +430,7 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return rendertemplate(htmltemplate)
 
 @app.route('/deobfuscate', methods=['POST'])
 def deobfuscate():
@@ -448,5 +448,4 @@ def deobfuscate():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+app.run(debug=False, host='0.0.0.0', port=5000)
