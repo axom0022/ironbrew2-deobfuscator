@@ -1,7 +1,7 @@
 # IronBrew Lua Deobfuscator
 ### axomic
 
-A tool to reverse IronBrew/AztupBrew obfuscation. converts it back to readable Lua source.
+A tool to reverse IronBrew2, AztupBew V2.7.2 obfuscation. converts it back to readable Lua source.
 
 ## Features
 
